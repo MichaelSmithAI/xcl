@@ -48,7 +48,7 @@ struct QueueFence {
 
 static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
 
-/// The legacy fallback deadline. Progress writes still require confirmed completion.
+/// Time before logging a slow submission and sampling its fence directly.
 const WAIT_MS: u32 = 10_000;
 
 fn spawn_queue_worker(dev: ID3D12Device, fence: ID3D12Fence) -> mpsc::Sender<Job> {
@@ -57,29 +57,29 @@ fn spawn_queue_worker(dev: ID3D12Device, fence: ID3D12Fence) -> mpsc::Sender<Job
         let event = CreateEventW(None, false, false, None).ok().map(|event| Owned::new(event));
         let handle = event.as_deref().copied();
         for job in rx {
-            let mut completed = fence::wait(&fence, job.value, &dev, handle, WAIT_MS);
+            if let Err(e) = fence::wait(&fence, job.value, &dev, handle, WAIT_MS) {
+                if matches!(e, FenceError::Removed(_)) {
+                    crate::xlog_error!("D3D12.X: discarded deferred writes at fence value {}: {e}", job.value);
+                    break;
+                }
+                crate::xlog_warn!("D3D12.X: deferred writes at fence value {}: {e}; still waiting for the producer", job.value);
+                // A timed-out event registration may still be active. Sample the fence
+                // directly, keeping the entire submission and its successors in order.
+                let completion = loop {
+                    match fence::completed_value(&fence, &dev) {
+                        Ok(value) if value < job.value => std::thread::sleep(Duration::from_millis(20)),
+                        result => break result,
+                    }
+                };
+                if let Err(e) = completion {
+                    crate::xlog_error!("D3D12.X: discarded deferred writes at fence value {}: {e}", job.value);
+                    break;
+                }
+            }
             for w in &job.writes {
                 match w {
                     Write::Immediate(va, words) => write_now(*va, words),
-                    Write::ImmediateU64(va, value) => {
-                        if let Err(e) = &completed {
-                            if !matches!(e, FenceError::Removed(_)) {
-                                crate::xlog_warn!("D3D12.X: deferred 64-bit write at {va:#x}: {e}; still waiting for the producer");
-                                // A timed-out event registration may still be active. Sample
-                                // the fence directly, keeping later writes behind this one.
-                                completed = loop {
-                                    match fence::completed_value(&fence, &dev) {
-                                        Ok(value) if value < job.value => std::thread::sleep(Duration::from_millis(20)),
-                                        result => break result.map(|_| ()),
-                                    }
-                                };
-                            }
-                        }
-                        match &completed {
-                            Ok(()) => write_u64_now(*va, *value),
-                            Err(e) => crate::xlog_error!("D3D12.X: deferred 64-bit write at {va:#x} did not complete: {e}"),
-                        }
-                    }
+                    Write::ImmediateU64(va, value) => write_u64_now(*va, *value),
                     Write::ReadbackU64 { va, src, .. } => {
                         let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
                         write_u64_now(*va, value);
@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn write64_bottom_progress_waits_past_legacy_timeout() {
+    fn bottom_of_pipe_progress_waits_past_legacy_timeout() {
         use super::super::list_x;
         use std::time::{Duration, Instant};
 
@@ -264,18 +264,16 @@ mod tests {
                 pending = Some((fence.clone(), value));
                 Ok(())
             });
-            let timed_out = queued && wait_for_marker(prefix, Duration::from_millis(WAIT_MS.into()) + DRAIN);
             let unrelated_queued = enqueue(&unrelated, vec![Write::Immediate(unrelated_marker.as_ptr() as usize, vec![1])], |fence, value| unrelated.Signal(fence, value));
             let isolated = unrelated_queued && wait_for_marker(unrelated_marker, DRAIN);
-            // The legacy path writes two dwords. Acquire the following marker before reading
-            // them as u64, so the observation cannot race those differently sized stores.
-            let before = (timed_out && wait_for_marker(tail, Duration::from_secs(1)))
-                .then(|| progress.load(Ordering::Acquire));
+            let premature_prefix = queued && wait_for_marker(prefix, Duration::from_millis(WAIT_MS.into()) + DRAIN);
+            let premature_progress = progress.load(Ordering::Acquire);
+            let premature_tail = tail.load(Ordering::Acquire);
             let held = pending.as_ref().map(|(f, _)| fence::completed_value(f, &dev));
             let released = pending.map(|(f, value)| f.Signal(value));
             let drained = queued && wait_for_marker(tail, DRAIN);
             let unrelated_drained = isolated || (unrelated_queued && wait_for_marker(unrelated_marker, DRAIN));
-            let after = drained.then(|| progress.load(Ordering::Acquire));
+            let after = drained.then(|| (prefix.load(Ordering::Acquire), progress.load(Ordering::Acquire)));
             forget_queue(producer.as_raw() as usize);
             forget_queue(unrelated.as_raw() as usize);
             // After a failed drain, a worker may still hold these addresses.
@@ -284,11 +282,12 @@ mod tests {
             }
 
             assert!(queued, "queue deferred writes");
-            assert!(timed_out, "legacy prefix write did not witness the timeout fallback");
             assert!(matches!(held, Some(Ok(0))), "producer fence did not stay pending: {held:?}");
             released.expect("producer fence was captured").expect("release the producer fence");
-            assert_eq!(before, None, "progress or its following write landed before fence completion");
-            assert_eq!(after, Some(EXPECTED), "progress did not land in order after the fence signaled");
+            assert!(!premature_prefix, "32-bit progress landed before fence completion");
+            assert_eq!(premature_progress, 0, "64-bit progress landed before fence completion");
+            assert_eq!(premature_tail, 0, "trailing write landed before fence completion");
+            assert_eq!(after, Some((1, EXPECTED)), "progress did not land in order after the fence signaled");
             assert!(isolated, "an unrelated queue's write did not land while the producer was held");
         }
     }
