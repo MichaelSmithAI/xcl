@@ -94,7 +94,13 @@ pub fn decode_lanes(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Err
     if out_len % 8 != 0 {
         return Err(Error::OutputSize);
     }
-    let (symbols, consumed) = lanes::decode(src, widths, out_len / 8)?;
+    // The published mode-6 streams establish the omitted-suffix convention
+    // for BC7. Keep other formats' existing acceptance rules.
+    let (symbols, consumed) = if mode == 7 {
+        lanes::decode_bc7(src, widths, out_len / 8)?
+    } else {
+        lanes::decode(src, widths, out_len / 8)?
+    };
     if src[consumed..].iter().any(|&b| b != 0) {
         return Err(Error::Trailing { consumed });
     }

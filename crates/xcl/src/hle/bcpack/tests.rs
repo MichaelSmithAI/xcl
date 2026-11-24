@@ -70,6 +70,32 @@ fn fixtures_decode_to_their_lanes() {
     }
 }
 
+/// Source-built mode-6 packet from Xbox2Windows #442 (MIT), no preset history.
+/// https://github.com/R0Y00/Xbox2Windows/blob/64ecc8738ea447b3d9a1cb7f9fc891bbb945ee3b/tests/bcpack_mode6_vector.py
+#[test]
+fn flushed_bc7_fragments_restore_omitted_zero_bytes() {
+    let packet = [
+        0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x03, 0x03,
+        0x03, 0x03, 0x04, 0x04, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x40,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x40, 0x02, 0x02, 0x75, 0x46,
+        0x28, 0x18, 0x00, 0x00, 0x01, 0x01, 0xdf, 0x5f, 0x4b, 0x7c, 0x03, 0x41,
+        0x02, 0x02, 0x02, 0x41, 0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x03,
+        0x10, 0x10, 0x10, 0x10, 0x40, 0x04, 0x10, 0x01, 0x03, 0x03, 0x03, 0x04,
+        0x40, 0x01, 0x08, 0x00, 0x01, 0x01, 0x01, 0x04, 0x00, 0x00, 0x00, 0x08,
+        0x00, 0x00, 0x00, 0x00, 0x41, 0x02, 0x09, 0x94, 0xe4, 0xdb, 0x27, 0xa4,
+        0x41, 0x05, 0x11, 0xfe, 0x6b, 0x02, 0x00, 0x05,
+    ];
+    let expected = [
+        0, 0, 117, 70, 40, 24, 0, 0, 0, 0, 0, 8, 228, 219, 39, 20,
+        0, 0, 223, 95, 75, 124, 0, 0, 0, 0, 0, 148, 254, 107, 2, 0,
+    ];
+    assert_eq!(decode_lanes(7, &packet, 16).as_deref(), Ok(&expected[..]));
+    assert!(matches!(decode_lanes(7, &packet[..packet.len() - 1], 16), Err(Error::Truncated { .. })));
+    let mut trailing = packet.to_vec();
+    trailing.push(1);
+    assert_eq!(decode_lanes(7, &trailing, 16), Err(Error::Trailing { consumed: packet.len() }));
+}
+
 /// The 8-bit model 11 as US 11,234,023 prints it (its `base_table[8][12]`, counted from 1).
 #[test]
 fn model_matches_the_patent_excerpt() {
@@ -185,7 +211,7 @@ fn random_stream(widths: &[u8], units: usize, rng: &mut Rng) -> (Vec<u8>, Vec<u8
         queues.push(bytes.into());
     }
     let mut stream = Vec::new();
-    let got = lanes::run(widths, units, |lane| {
+    let got = lanes::run(widths, units, false, |lane| {
         let b = queues[lane].pop_front();
         stream.extend(b);
         b

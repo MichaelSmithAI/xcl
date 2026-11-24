@@ -115,17 +115,40 @@ struct Lane {
     p1: u32,
     hdr3: bool,
     flush: bool,
+    implied_zeros: u8,
     q: u8,
     model: Model,
     stalled: bool,
+}
+
+impl Lane {
+    /// Restore cropped BC7 bytes at physical fragment exhaustion. The
+    /// Xbox2Windows mode-6 fixture exercises this convention.
+    fn restore_zero_suffix(&mut self, mut state: u32) -> u32 {
+        if self.flush {
+            while state != 0 && state < L && self.implied_zeros < 2 {
+                state <<= 8;
+                self.implied_zeros += 1;
+            }
+        }
+        state
+    }
 }
 
 /// Decode the lanes of one stream: `widths[i]` is lane i's symbol width in bits (1..=8),
 /// `units` the number of symbols every lane holds. The symbols come back unit by unit
 /// (`symbols[unit * lanes + lane]`), with the number of bytes of `src` the lanes read.
 pub(super) fn decode(src: &[u8], widths: &[u8], units: usize) -> Result<(Vec<u8>, usize), Error> {
+    decode_with_suffix(src, widths, units, false)
+}
+
+pub(super) fn decode_bc7(src: &[u8], widths: &[u8], units: usize) -> Result<(Vec<u8>, usize), Error> {
+    decode_with_suffix(src, widths, units, true)
+}
+
+fn decode_with_suffix(src: &[u8], widths: &[u8], units: usize, restore_suffix: bool) -> Result<(Vec<u8>, usize), Error> {
     let mut pos = 0;
-    let symbols = run(widths, units, |_| {
+    let symbols = run(widths, units, restore_suffix, |_| {
         let b = src.get(pos).copied();
         pos += b.is_some() as usize;
         b
@@ -134,7 +157,7 @@ pub(super) fn decode(src: &[u8], widths: &[u8], units: usize) -> Result<(Vec<u8>
 }
 
 /// [`decode`] with the stream as a function: the next byte, for the lane that gets it.
-pub(super) fn run(widths: &[u8], units: usize, mut next: impl FnMut(usize) -> Option<u8>) -> Result<Vec<u8>, Error> {
+pub(super) fn run(widths: &[u8], units: usize, restore_suffix: bool, mut next: impl FnMut(usize) -> Option<u8>) -> Result<Vec<u8>, Error> {
     let n = widths.len();
     assert!(n > 0 && widths.iter().all(|w| (1..=8).contains(w)));
     if units == 0 {
@@ -161,6 +184,7 @@ pub(super) fn run(widths: &[u8], units: usize, mut next: impl FnMut(usize) -> Op
             p1: 0,
             hdr3: false,
             flush: false,
+            implied_zeros: 0,
             q: 0,
             model: Model::new(bits as usize, 0),
             stalled: false,
@@ -235,6 +259,7 @@ pub(super) fn run(widths: &[u8], units: usize, mut next: impl FnMut(usize) -> Op
                         l.input_remaining = 0;
                         l.q = b & 15;
                         l.flush = b & 0x10 != 0;
+                        l.implied_zeros = 0;
                         l.hdr3 = b & 0x20 != 0;
                         let z = b >> 6;
                         if z >= l.bits {
@@ -269,6 +294,11 @@ pub(super) fn run(widths: &[u8], units: usize, mut next: impl FnMut(usize) -> Op
                 Ctrl::Processing => {
                     let feed = l.p0 < L && l.input_remaining > 0 && l.input_buf_full;
                     let x = if feed { l.p0 << 8 | l.input_buf as u32 } else { l.p0 };
+                    let x = if restore_suffix && l.input_remaining == u32::from(feed) {
+                        l.restore_zero_suffix(x)
+                    } else {
+                        x
+                    };
                     let out = x > L && l.output_remaining > 0;
                     if out {
                         l.sym = l.model.symbol(x & 0xFFFF);
@@ -299,7 +329,7 @@ pub(super) fn run(widths: &[u8], units: usize, mut next: impl FnMut(usize) -> Op
                     }
                 }
                 Ctrl::Draining => {
-                    let x = l.p0;
+                    let x = if restore_suffix { l.restore_zero_suffix(l.p0) } else { l.p0 };
                     let out = x > L && l.output_remaining > 0;
                     if out {
                         l.sym = l.model.symbol(x & 0xFFFF);
