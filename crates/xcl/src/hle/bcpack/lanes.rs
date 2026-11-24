@@ -143,7 +143,12 @@ pub(super) fn decode(src: &[u8], widths: &[u8], units: usize) -> Result<(Vec<u8>
 }
 
 pub(super) fn decode_bc7(src: &[u8], widths: &[u8], units: usize) -> Result<(Vec<u8>, usize), Error> {
-    decode_with_suffix(src, widths, units, true)
+    match decode(src, widths, units) {
+        // A shortened reset fragment can end before the lane emits all of
+        // its symbols. Preserve successful ordinary decoding verbatim.
+        Err(Error::EndState { .. }) => decode_with_suffix(src, widths, units, true),
+        result => result,
+    }
 }
 
 fn decode_with_suffix(src: &[u8], widths: &[u8], units: usize, restore_suffix: bool) -> Result<(Vec<u8>, usize), Error> {
