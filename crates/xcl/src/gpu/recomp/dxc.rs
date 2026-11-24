@@ -672,7 +672,7 @@ fn cache_mutex_name(file: &Path) -> String {
     format!(r"Local\XclDxilCache-{h:016x}")
 }
 
-fn normalized_cache_dir(dir: &Path) -> PathBuf {
+pub(crate) fn normalized_cache_dir(dir: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(dir) {
         return canonical;
     }

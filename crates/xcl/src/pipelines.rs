@@ -3,7 +3,7 @@
 //! title asks for, so its pipelines are ready when it binds them – before the next run, or
 //! during this one (`--watch` follows the journal as the title writes it, at below-normal
 //! priority). Pipelines the title used come first. What is done is kept next to the journal
-//! (`pipelines.done`, for this XCL binary), so a stopped run goes on where it was.
+//! (`pipelines.done`, for this XCL binary and DXIL cache), so a stopped run goes on where it was.
 //! It must be the same xcl.exe as the title's: the translations' cache key holds the binary's
 //! hash, and the driver keeps its cache per program.
 
@@ -39,13 +39,18 @@ fn journal_of(target: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// This binary (size and time written): what `pipelines.done` is valid for.
-fn binary_key() -> u64 {
+/// The executable and destination DXIL cache that `pipelines.done` refers to.
+fn progress_key(cache: &Path) -> u64 {
+    let cache = crate::gpu::recomp::dxc::normalized_cache_dir(cache);
     let m = std::env::current_exe().and_then(std::fs::metadata);
-    m.map_or(0, |m| {
+    let (size, modified) = m.map_or((0, 0), |m| {
         let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
-        crate::gpu::shader::fnv64(&[m.len().to_le_bytes(), t.to_le_bytes()].concat())
-    })
+        (m.len(), t)
+    });
+    let mut bytes = size.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&modified.to_le_bytes());
+    bytes.extend_from_slice(cache.as_os_str().as_encoded_bytes());
+    crate::gpu::shader::fnv64(&bytes)
 }
 
 #[derive(Default)]
@@ -186,9 +191,9 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         }
     };
     let q = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
-    // what an earlier run of this binary finished
+    // what an earlier run of this binary finished for this cache
     let done_path = journal.with_extension("done");
-    let key = binary_key();
+    let key = progress_key(&crate::gpu::recomp::dxc::cache_dir());
     let mut done_file = {
         let old = std::fs::read(&done_path).unwrap_or_default();
         let mut g = q.0.lock().unwrap();

@@ -113,10 +113,10 @@ fn pipeline_journal_cli_compiles_and_resumes() {
         bytes.extend_from_slice(data);
     }
     std::fs::write(&journal, bytes).unwrap();
-    let run = |expected: &str, failed: usize| {
+    let run = |cache: &std::path::Path, expected: &str, failed: usize| {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_xcl"))
             .arg("pipelines").arg(&journal).args(["--threads", "1"])
-            .env("XCL_DXIL_CACHE", &cache).env("XCL_PIPELINE_THREADS", "1")
+            .env("XCL_DXIL_CACHE", cache).env("XCL_PIPELINE_THREADS", "1")
             .output().unwrap();
         let log = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         println!("{log}");
@@ -126,20 +126,34 @@ fn pipeline_journal_cli_compiles_and_resumes() {
         log
     };
     assert!(!cache.exists(), "first run must start without an application cache");
-    run("made 1,", 0);
+    run(&cache, "made 1,", 0);
     let done = journal.with_extension("done");
     let progress = std::fs::read(&done).unwrap();
     assert_eq!(progress.len(), 16, "binary key and one completed pipeline");
     assert_eq!(&progress[8..], &hash.to_le_bytes());
-    let resumed = run("made 0,", 0);
+    let resumed = run(&cache, "made 0,", 0);
     assert!(resumed.contains("1 done before"), "{resumed}");
     assert_eq!(std::fs::read(&done).unwrap(), progress);
     // A different binary key invalidates progress, even with a populated DXIL cache.
     let mut stale = progress.clone();
     stale[0] ^= 1;
     std::fs::write(&done, stale).unwrap();
-    run("made 1,", 0);
+    run(&cache, "made 1,", 0);
     assert_eq!(std::fs::read(&done).unwrap(), progress);
+    // A second destination starts cold with the same executable and journal.
+    let other_cache = dir.join("dxil-other");
+    assert!(!other_cache.exists());
+    run(&other_cache, "made 1,", 0);
+    assert!(other_cache.read_dir().unwrap().any(|entry| {
+        entry.unwrap().path().extension().is_some_and(|ext| ext == "dxil")
+    }));
+    let other_progress = std::fs::read(&done).unwrap();
+    assert_eq!(other_progress.len(), 16);
+    assert_ne!(&other_progress[..8], &progress[..8]);
+    assert_eq!(&other_progress[8..], &hash.to_le_bytes());
+    let resumed = run(&other_cache, "made 0,", 0);
+    assert!(resumed.contains("1 done before"), "{resumed}");
+    assert_eq!(std::fs::read(&done).unwrap(), other_progress);
     // An incomplete compute payload cannot be replayed and must remain retryable.
     let mut broken = vec![b'C', 4, 0, 0];
     le(&mut broken, 8);
@@ -148,10 +162,10 @@ fn pipeline_journal_cli_compiles_and_resumes() {
     use std::io::Write;
     std::fs::OpenOptions::new().append(true).open(&journal).unwrap().write_all(&broken).unwrap();
     for _ in 0..2 {
-        let retried = run("made 0,", 1);
+        let retried = run(&other_cache, "made 0,", 1);
         assert!(retried.contains("1 pipelines to make"), "{retried}");
         assert!(retried.contains("not readable from the journal"), "{retried}");
-        assert_eq!(std::fs::read(&done).unwrap(), progress, "a failure must not enter completed progress");
+        assert_eq!(std::fs::read(&done).unwrap(), other_progress, "a failure must not enter completed progress");
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
