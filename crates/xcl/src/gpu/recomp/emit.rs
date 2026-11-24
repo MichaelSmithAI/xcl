@@ -2142,7 +2142,8 @@ impl Em {
             }
             if has_b {
                 i_bias = Some(shape.len());
-                shape.push((h, !a16));
+                // A16 stores bias in the low half of a dedicated dword.
+                shape.push((h, true));
             }
             if has_c {
                 i_cmp = Some(shape.len());
@@ -2154,7 +2155,7 @@ impl Em {
             }
             i_body = shape.len();
             for k in 0..body {
-                shape.push((h, !a16 || (grad_n != 0 && k == 0)));
+                shape.push((h, !a16 || (k == 0 && (has_b || grad_n != 0))));
             }
             if has_l {
                 i_extra = Some(shape.len());

@@ -2454,6 +2454,34 @@ fn gpu_static_samplers_from_constants_in_code() {
 }
 
 #[test]
+fn a16_sample_bias_occupies_its_own_word() {
+    // llvm-mc -triple amdgcn -mcpu=gfx1030 -show-encoding:
+    // v_mov_b32_e32 v4, 0x3b003800   ; bias = 0.5, high half = decoy 0.875
+    // v_mov_b32_e32 v5, 0x3a003400   ; coordinates = (0.25, 0.75)
+    // image_sample_b v10, v[4:5], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D a16
+    // exp mrt0, v10, off, off, off done
+    // s_endpgm
+    let code = [
+        0xff, 0x02, 0x08, 0x7e, 0x00, 0x38, 0x00, 0x3b,
+        0xff, 0x02, 0x0a, 0x7e, 0x00, 0x34, 0x00, 0x3a,
+        0x08, 0x01, 0x94, 0xf0, 0x04, 0x0a, 0xc4, 0x40,
+        0x01, 0x08, 0x00, 0xf8, 0x0a, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x81, 0xbf,
+    ];
+    let target = crate::gpu::dxbc::SigElement {
+        name: "SV_Target".into(), index: 0, system_value: 64, component_type: 3,
+        register: 0, mask: 1, rw_mask: 1, stream: 0,
+    };
+    let ps = crate::gpu::recomp::PsInterface { outputs: vec![target], ..Default::default() };
+    let opts = Options { mode: Mode::Pixel(ps), wave64: false, ..Default::default() };
+    let t = translate(&code, &opts).unwrap();
+    assert!(t.unsupported.is_empty(), "{:?}", t.unsupported);
+    let sample = t.hlsl.lines().find(|line| line.contains(".SampleBias(")).unwrap();
+    let args = "float2(f16tof32((v5 >> 0u) & 0xFFFFu), f16tof32((v5 >> 16u) & 0xFFFFu)), f16tof32((v4 >> 0u) & 0xFFFFu)";
+    assert!(sample.contains(args), "{sample}");
+}
+
+#[test]
 fn gpu_images_a16_d16() {
     if !gpu_ready() {
         return;
