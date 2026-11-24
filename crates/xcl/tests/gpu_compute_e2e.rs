@@ -81,6 +81,68 @@ fn console_cs(code: &[u8], rsrc2: u32, threads: [u32; 3]) -> Vec<u8> {
 
 const V: u64 = 256; // VALU source code of v0
 
+#[test]
+fn pipeline_journal_cli_compiles_and_resumes() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no wave64");
+        return;
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl_pipeline_cli_{}_{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let journal = dir.join("pipelines.bin");
+    let cache = dir.join("dxil");
+    let blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
+    let shader_hash = xcl::gpu::shader::fnv64(&blob);
+    // The journal stores the shader hash, desc size, then a pointer-free desc.
+    let mut payload = shader_hash.to_le_bytes().to_vec();
+    let desc_size = std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>();
+    le(&mut payload, desc_size as u32);
+    payload.resize(payload.len() + desc_size, 0);
+    let hash = xcl::gpu::shader::fnv64(&[payload.as_slice(), &[4]].concat());
+    let mut bytes = xcl::hle::d3d12x::pso_journal::MAGIC.to_vec();
+    for (tag, windows, hash, data) in [(b'S', 0, shader_hash, blob.as_slice()), (b'C', 4, hash, payload.as_slice()), (b'U', 0, hash, &[][..])] {
+        bytes.extend_from_slice(&[tag, windows, 0, 0]);
+        le(&mut bytes, data.len() as u32);
+        bytes.extend_from_slice(&hash.to_le_bytes());
+        bytes.extend_from_slice(data);
+    }
+    std::fs::write(&journal, bytes).unwrap();
+    let run = |expected: &str| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("pipelines").arg(&journal).args(["--threads", "1"])
+            .env("XCL_DXIL_CACHE", &cache).env("XCL_PIPELINE_THREADS", "1")
+            .output().unwrap();
+        let log = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        println!("{log}");
+        assert!(out.status.success(), "{log}");
+        assert!(log.contains(expected), "{log}");
+        assert!(log.contains("failed 0"), "{log}");
+        log
+    };
+    assert!(!cache.exists(), "first run must start without an application cache");
+    run("made 1,");
+    let done = journal.with_extension("done");
+    let progress = std::fs::read(&done).unwrap();
+    assert_eq!(progress.len(), 16, "binary key and one completed pipeline");
+    assert_eq!(&progress[8..], &hash.to_le_bytes());
+    let resumed = run("made 0,");
+    assert!(resumed.contains("1 done before"), "{resumed}");
+    assert_eq!(std::fs::read(&done).unwrap(), progress);
+    // A different binary key invalidates progress, even with a populated DXIL cache.
+    let mut stale = progress.clone();
+    stale[0] ^= 1;
+    std::fs::write(&done, stale).unwrap();
+    run("made 1,");
+    assert_eq!(std::fs::read(&done).unwrap(), progress);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
 /// s2/s3, thread ids in v0/v1: each thread writes its global (x, y), and through LDS +
 /// s_barrier the (x, y) of the thread at the mirrored index, which is in the other wave.

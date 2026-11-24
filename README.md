@@ -125,6 +125,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 xcl pipelines D:\Games\SomeTitle [--watch]  # compile the pipelines a run queued (<data>\cache\pipelines.bin)
 ```
 
+`xcl pipelines` resumes from `pipelines.done` beside the journal. Replacing the XCL executable
+starts a fresh progress record; use the same executable for the game and the pipeline tool.
+
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.

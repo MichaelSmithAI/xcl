@@ -196,16 +196,21 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             g.taken.extend(old[8..].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())));
         }
         let fresh = g.taken.is_empty();
-        let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&done_path) {
+        let mut f = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&done_path) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("xcl pipelines: {}: {e}", done_path.display());
                 return 2;
             }
         };
-        if fresh {
-            let _ = f.set_len(0);
-            let _ = f.write_all(&key.to_le_bytes());
+        let positioned = if fresh {
+            f.set_len(0).and_then(|_| f.seek(std::io::SeekFrom::Start(0))).and_then(|_| f.write_all(&key.to_le_bytes()))
+        } else {
+            f.seek(std::io::SeekFrom::End(0)).map(|_| ())
+        };
+        if let Err(e) = positioned {
+            eprintln!("xcl pipelines: {}: {e}", done_path.display());
+            return 2;
         }
         f
     };
