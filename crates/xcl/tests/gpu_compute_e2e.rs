@@ -113,7 +113,7 @@ fn pipeline_journal_cli_compiles_and_resumes() {
         bytes.extend_from_slice(data);
     }
     std::fs::write(&journal, bytes).unwrap();
-    let run = |expected: &str| {
+    let run = |expected: &str, failed: usize| {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_xcl"))
             .arg("pipelines").arg(&journal).args(["--threads", "1"])
             .env("XCL_DXIL_CACHE", &cache).env("XCL_PIPELINE_THREADS", "1")
@@ -122,24 +122,37 @@ fn pipeline_journal_cli_compiles_and_resumes() {
         println!("{log}");
         assert!(out.status.success(), "{log}");
         assert!(log.contains(expected), "{log}");
-        assert!(log.contains("failed 0"), "{log}");
+        assert!(log.contains(&format!("failed {failed},")), "{log}");
         log
     };
     assert!(!cache.exists(), "first run must start without an application cache");
-    run("made 1,");
+    run("made 1,", 0);
     let done = journal.with_extension("done");
     let progress = std::fs::read(&done).unwrap();
     assert_eq!(progress.len(), 16, "binary key and one completed pipeline");
     assert_eq!(&progress[8..], &hash.to_le_bytes());
-    let resumed = run("made 0,");
+    let resumed = run("made 0,", 0);
     assert!(resumed.contains("1 done before"), "{resumed}");
     assert_eq!(std::fs::read(&done).unwrap(), progress);
     // A different binary key invalidates progress, even with a populated DXIL cache.
     let mut stale = progress.clone();
     stale[0] ^= 1;
     std::fs::write(&done, stale).unwrap();
-    run("made 1,");
+    run("made 1,", 0);
     assert_eq!(std::fs::read(&done).unwrap(), progress);
+    // An incomplete compute payload cannot be replayed and must remain retryable.
+    let mut broken = vec![b'C', 4, 0, 0];
+    le(&mut broken, 8);
+    broken.extend_from_slice(&(hash ^ 1).to_le_bytes());
+    broken.extend_from_slice(&shader_hash.to_le_bytes());
+    use std::io::Write;
+    std::fs::OpenOptions::new().append(true).open(&journal).unwrap().write_all(&broken).unwrap();
+    for _ in 0..2 {
+        let retried = run("made 0,", 1);
+        assert!(retried.contains("1 pipelines to make"), "{retried}");
+        assert!(retried.contains("not readable from the journal"), "{retried}");
+        assert_eq!(std::fs::read(&done).unwrap(), progress, "a failure must not enter completed progress");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
